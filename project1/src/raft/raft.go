@@ -75,16 +75,17 @@ type LogEntry struct {
 type AppendEntriesArgs struct {
 	Term         int        // leader's term
 	LeaderId     int        // Leader's ID
-	PrevLogIndex int        // TODO
-	PrevLogTerm  int        // TODO
+	PrevLogIndex int        // Check if log matches
+	PrevLogTerm  int        // Check if log matches
 	Entries      []LogEntry // Log entries to store
-	LeaderCommit int        // TODO
+	LeaderCommit int        // Highest known committed entry
 }
 
 // AppendEntries RPC reply by candidate or follower
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term      int
+	AckLength int
+	Success   bool
 }
 
 //
@@ -132,6 +133,10 @@ type Raft struct {
 	logs              []LogEntry    // Stored logs in the server
 	electionTimeout   int64         // Randomly selected timeout in ms
 	applyCh           chan ApplyMsg // Channel to apply the command to state machine
+	commitIndex       int           // index of highest known committed log entry
+	lastApplied       int           // index of highest known applied log entry
+	nextIndex         []int         // index of next log entry to send, use definition in the lecture slides
+	matchIndex        []int         // index of highest known log entry that has been replicated
 }
 
 // Reselect election timeout by randomly selecting from 500ms ~ 750ms
@@ -160,6 +165,21 @@ func (rf *Raft) transitToFollower(term int, votedFor int) {
 	rf.cancelElectionTimeout()
 	// Reselect a election timeout duration
 	rf.ReselectElectionTimeout()
+}
+
+// NOTE: Must be called within critical session
+func (rf *Raft) initNextMatchIndex() {
+	// nextIndex -> off by 1 w.r.t. the original definition
+	newNextIdx := len(rf.logs)
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = newNextIdx
+	}
+	// matchIndex -> 0
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.matchIndex[i] = 0
+	}
 }
 
 // return currentTerm and whether this server
@@ -316,6 +336,34 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Unlock()
 }
 
+// Determine if the log entry is committed or not used by leader
+// NOTE: MUST be called within a critical session
+func (rf *Raft) commitLogEntries() {
+	// 7 -> >3
+	// 8 -> >4
+	majorityNum := len(rf.peers) / 2
+	// Find the maximum log entry that has been replicated on majority in this term
+	maxIdx := -1
+	for i := 1; i <= len(rf.logs); i++ {
+		cnt := 0
+		// Check each peer's log status
+		for j := 0; j < len(rf.peers); j++ {
+			if rf.matchIndex[j] >= i {
+				cnt += 1
+			}
+		}
+		if cnt > majorityNum && i > maxIdx {
+			maxIdx = i
+		}
+	}
+	if maxIdx > rf.commitIndex && rf.logs[maxIdx-1].Term == rf.currentTerm {
+		for i := rf.commitIndex; i < maxIdx; i++ {
+			// TODO: Apply to the state machine
+		}
+		rf.commitIndex = maxIdx
+	}
+}
+
 // AppendEntries RPC used by leader
 func (rf *Raft) sendAppendEntries(
 	server int,
@@ -327,7 +375,7 @@ func (rf *Raft) sendAppendEntries(
 	LeaderCommit int) {
 
 	appendRequest := AppendEntriesArgs{Term, LeaderId, PrevLogIndex, PrevLogTerm, Entries, LeaderCommit}
-	appendReply := AppendEntriesReply{0, false}
+	appendReply := AppendEntriesReply{0, 0, false}
 	// Keep sending the message until it succeeds
 	for {
 		if rf.peers[server].Call("Raft.AppendEntries", &appendRequest, &appendReply) {
@@ -335,12 +383,51 @@ func (rf *Raft) sendAppendEntries(
 		}
 	}
 
-	// TODO: Need to complete the acknolwedgement from followers
+	rf.mu.Lock()
+	if appendReply.Term == rf.currentTerm && rf.roleState == statusLeader {
+		// Check if the message is out-dated or not
+		if appendReply.Success && appendReply.AckLength >= rf.matchIndex[server] {
+			rf.nextIndex[server] = appendReply.AckLength
+			rf.matchIndex[server] = appendReply.AckLength
+			rf.commitLogEntries()
+		} else if rf.nextIndex[server] > 0 {
+			// Decrement next index and retry
+			rf.nextIndex[server] -= 1
+			rf.ReplicateLog(LeaderId, server)
+		}
+	} else if appendReply.Term > rf.currentTerm {
+		rf.transitToFollower(appendReply.Term, -1)
+	}
+
+	rf.mu.Unlock()
+}
+
+// The helper function to perform actual append entries operation
+// NOTE: MUST be called within a critical session
+func (rf *Raft) AppendEntriesHelper(logLength int, leaderCommit int, entries []LogEntry) {
+	if len(entries) > 0 && len(rf.logs) > logLength {
+		if rf.logs[logLength].Term != entries[0].Term {
+			// Delete out-dated-log entries
+			rf.logs = rf.logs[:logLength]
+		}
+	}
+	// Append new log entries from leader
+	if (logLength + len(entries)) > len(rf.logs) {
+		for i := (len(rf.logs) - logLength); i < len(entries); i++ {
+			rf.logs = append(rf.logs, entries[i])
+		}
+	}
+	if leaderCommit > rf.commitIndex {
+		// Apply the logs to state machine
+		for i := rf.commitIndex; i < leaderCommit; i++ {
+			// TODO: Apply rf.logs[i]
+		}
+		rf.commitIndex = leaderCommit
+	}
 }
 
 // AppendEntries RPC handler by candidate or follower
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// TODO: Complete all the stuff here
 
 	rf.mu.Lock()
 	rf.cancelElectionTimeout()
@@ -356,12 +443,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if rf.currentTerm == args.Term && logOk {
-		// TODO: Complete all the stuff here
 		rf.roleState = statusFollower
+		rf.AppendEntriesHelper(args.PrevLogIndex, args.LeaderCommit, args.Entries)
+
+		// Send back success message
 		reply.Success = true
+		reply.AckLength = args.PrevLogIndex + len(args.Entries)
 		reply.Term = rf.currentTerm
 	} else {
+
+		// Send back failure message
 		reply.Success = false
+		reply.AckLength = 0
 		reply.Term = rf.currentTerm
 	}
 
@@ -379,6 +472,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Unlock()
 }
 
+// NOTE: MUST be called within critical session
+func (rf *Raft) ReplicateLog(leaderId int, followerId int) {
+	// next index to send until the end
+	var entriesToSend []LogEntry
+	for i := rf.nextIndex[followerId]; i < len(rf.logs); i++ {
+		entriesToSend = append(entriesToSend, rf.logs[i])
+	}
+	prevLogTerm := 0
+	if rf.nextIndex[followerId] > 0 {
+		prevLogTerm = rf.logs[rf.nextIndex[followerId]-1].Term
+	}
+	// Kick off the goroutine for sending AppendEntries RPC
+	go rf.sendAppendEntries(followerId,
+		rf.currentTerm,
+		leaderId,
+		rf.nextIndex[followerId],
+		prevLogTerm,
+		entriesToSend,
+		rf.commitIndex)
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -394,13 +508,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	// TODO: Check if need lock here
+	rf.mu.Lock()
 	index := len(rf.logs) + 1
 	term := rf.currentTerm
 	isLeader := (rf.roleState == statusLeader)
 
 	// Your code here (2B).
+	if isLeader {
+		// First, update own log entry
+		newLogEntry := LogEntry{command, rf.currentTerm}
+		rf.logs = append(rf.logs, newLogEntry)
+		rf.matchIndex[rf.me] = len(rf.logs)
+		for i := 0; i < len(rf.peers); i++ {
+			if i != rf.me {
+				// Kick off the go routine for replicating the command
+				rf.ReplicateLog(rf.me, i)
+			}
+		}
+	}
 
+	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -481,6 +608,8 @@ func (rf *Raft) electionTimeoutMonitor() {
 			if rf.voteCnt > majorityNum {
 				// Win the election
 				rf.roleState = statusLeader
+				// Re-initialize next & match index
+				rf.initNextMatchIndex()
 				fmt.Print("Server ", strconv.Itoa(rf.me), " wins the election.\n")
 			} else {
 				// Check if election timeouts and start another election
@@ -513,8 +642,8 @@ func (rf *Raft) appendEntriesRoutine() {
 				rf.lastSendTimeStamp = rf.getSysTime()
 				for i := 0; i < len(rf.peers); i++ {
 					if i != rf.me {
-						// TODO: Change PrevLogTerm & etc
-						go rf.sendAppendEntries(i, rf.currentTerm, rf.me, 0, 0, make([]LogEntry, 0), 0)
+						// go rf.sendAppendEntries(i, rf.currentTerm, rf.me, 0, 0, make([]LogEntry, 0), 0)
+						rf.ReplicateLog(rf.me, i)
 					}
 				}
 			}
@@ -545,6 +674,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.applyCh = applyCh
 	rf.transitToFollower(0, -1)
+	// Initialize next & match index
+	rf.initNextMatchIndex()
+	// Initialize commit info
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	// Reset the timer
 	rf.lastRecvTimeStamp = rf.getSysTime()
 	rf.lastSendTimeStamp = rf.lastRecvTimeStamp
