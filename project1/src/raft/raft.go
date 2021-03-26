@@ -33,8 +33,8 @@ import (
 // Heartbeat period = 150ms (at least 100ms)
 // Election timeout period = 500ms ~ 750ms (need to elect new leader within 5s)
 const (
-	electionUpperBound = 1350
-	electionLowerBound = 750
+	electionUpperBound = 750
+	electionLowerBound = 450
 	heartBeatPeriod    = 150
 )
 
@@ -161,9 +161,10 @@ func (rf *Raft) transitToFollower(term int, votedFor int) {
 	rf.roleState = statusFollower
 	rf.voteCnt = 0
 	// Always need to cancel election timeout
-	rf.cancelElectionTimeout()
+	// rf.cancelElectionTimeout()
 	// Reselect a election timeout duration
 	rf.ReselectElectionTimeout()
+	rf.persist()
 }
 
 // NOTE: Must be called within critical session
@@ -205,15 +206,20 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 
-	// TODO: Check if need lock here
 	// Persistently store currentTerm, VoteForID, Logs
+	// fmt.Print("Save state with term", strconv.Itoa(rf.currentTerm), "\n")
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.logs)
+	if e.Encode(rf.currentTerm) != nil ||
+		e.Encode(rf.votedFor) != nil ||
+		e.Encode(rf.logs) != nil ||
+		e.Encode(rf.commitIndex) != nil ||
+		e.Encode(rf.lastApplied) != nil {
+		log.Fatal("failed to encode raft persistent state")
+	}
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+
 }
 
 //
@@ -230,15 +236,23 @@ func (rf *Raft) readPersist(data []byte) {
 	var oldTerm int
 	var oldVoteFor int
 	var oldLogs []LogEntry
+	var oldCommitIndex int
+	var oldLastApplied int
 	if d.Decode(&oldTerm) != nil ||
 		d.Decode(&oldVoteFor) != nil ||
-		d.Decode(&oldLogs) != nil {
+		d.Decode(&oldLogs) != nil ||
+		d.Decode(&oldCommitIndex) != nil ||
+		d.Decode(&oldLastApplied) != nil {
 		// Search for better way of handling errors
 		log.Fatal("Error in restoring persistent states")
 	} else {
+		// fmt.Print("Recover with old term", strconv.Itoa(oldTerm), "\n")
 		rf.currentTerm = oldTerm
 		rf.votedFor = oldVoteFor
 		rf.logs = oldLogs
+		rf.commitIndex = oldCommitIndex
+		rf.lastApplied = oldLastApplied
+		// fmt.Print("Server ", strconv.Itoa(rf.me), " recovers with ", strconv.Itoa(len(rf.logs)), " entries\n")
 	}
 }
 
@@ -322,6 +336,15 @@ func (rf *Raft) sendRequestVote(
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	if args.Term > rf.currentTerm {
+		// Step down as a follower
+		// rf.transitToFollower(args.Term, -1)
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.roleState = statusFollower
+		rf.voteCnt = 0
+	}
+
 	lastLogTerm := 0
 	if len(rf.logs) > 0 {
 		lastLogTerm = rf.logs[len(rf.logs)-1].Term
@@ -340,8 +363,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// rf.votedFor = args.CandidateId
 		// rf.roleState = statusFollower
 		// rf.voteCnt = 0
-		// rf.ReselectElectionTimeout()
-		// rf.cancelElectionTimeout()
+		rf.ReselectElectionTimeout()
+		rf.cancelElectionTimeout()
 
 		// Send response
 		reply.Term = rf.currentTerm
@@ -425,34 +448,69 @@ func (rf *Raft) sendAppendEntries(
 // The helper function to perform actual append entries operation
 // NOTE: MUST be called within a critical session
 func (rf *Raft) AppendEntriesHelper(logLength int, leaderCommit int, entries []LogEntry) {
+	// fmt.Print("Reach here", strconv.Itoa(leaderCommit), "\n")
+	// fmt.Print(strconv.Itoa(len(rf.logs)), "\n")
 	if len(entries) > 0 && len(rf.logs) > logLength {
-		if rf.logs[logLength].Term != entries[0].Term {
-			// Delete out-dated-log entries
-			rf.logs = rf.logs[:logLength]
+		// fmt.Print("Reach here\n")
+		// firstConflictIdx := logLength
+		k := 0
+		for ; (k+logLength) < len(rf.logs) && k < len(entries); k++ {
+			if rf.logs[logLength+k].Term != entries[k].Term {
+				// Delete out-dated-log entries
+				rf.logs = rf.logs[:(k + logLength)]
+				break
+			}
 		}
+		entries = entries[k:]
+		// fmt.Print("Length of entries: ", strconv.Itoa(len(entries)), "\n")
+		rf.logs = append(rf.logs, entries...)
+	} else if len(entries) > 0 && len(rf.logs) == logLength {
+		rf.logs = append(rf.logs, entries...)
 	}
-	// Append new log entries from leader
-	if (logLength + len(entries)) > len(rf.logs) {
-		for i := (len(rf.logs) - logLength); i < len(entries); i++ {
-			rf.logs = append(rf.logs, entries[i])
-		}
-	}
+
 	if leaderCommit > rf.commitIndex {
 		// Apply the logs to state machine
+		lastIdx := len(rf.logs)
+		if leaderCommit < lastIdx {
+			rf.commitIndex = leaderCommit
+		} else {
+			rf.commitIndex = lastIdx
+		}
 		rf.cv.Signal()
-		rf.commitIndex = leaderCommit
 	}
 }
+
+// func (rf *Raft) AppendEntriesHelper(logLength int, leaderCommit int, entries []LogEntry) {
+// 	if len(entries) > 0 && len(rf.logs) > logLength {
+// 		if rf.logs[logLength].Term != entries[0].Term {
+// 			// Delete out-dated-log entries
+// 			rf.logs = rf.logs[:logLength]
+// 		}
+// 	}
+// 	// Append new log entries from leader
+// 	if (logLength + len(entries)) > len(rf.logs) {
+// 		for i := (len(rf.logs) - logLength); i < len(entries); i++ {
+// 			rf.logs = append(rf.logs, entries[i])
+// 		}
+// 	}
+// 	if leaderCommit > rf.commitIndex {
+// 		// Apply the logs to state machine
+// 		rf.cv.Signal()
+// 		rf.commitIndex = leaderCommit
+// 	}
+// }
 
 // AppendEntries RPC handler by candidate or follower
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
 	rf.mu.Lock()
-	// rf.cancelElectionTimeout()
-	// rf.ReselectElectionTimeout()
 	if args.Term > rf.currentTerm {
 		// Step down as a follower
-		rf.transitToFollower(args.Term, -1)
+		// rf.transitToFollower(args.Term, -1)
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.roleState = statusFollower
+		rf.voteCnt = 0
 	}
 	logOk := (len(rf.logs) >= args.PrevLogIndex)
 	if logOk && (args.PrevLogIndex > 0) {
@@ -463,8 +521,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm == args.Term && logOk {
 		rf.roleState = statusFollower
 		rf.AppendEntriesHelper(args.PrevLogIndex, args.LeaderCommit, args.Entries)
-		rf.cancelElectionTimeout()
+		// rf.cancelElectionTimeout()
 		rf.ReselectElectionTimeout()
+		rf.persist()
 		// Send back success message
 		reply.Success = true
 		reply.AckLength = args.PrevLogIndex + len(args.Entries)
@@ -477,16 +536,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 	}
 
-	// if rf.currentTerm <= args.Term {
-	// 	rf.lastRecvTimeStamp = rf.getSysTime()
-	// 	rf.roleState = statusFollower
-	// 	rf.ReselectElectionTimeout()
-	// }
-	// reply.Term = rf.currentTerm
-	// reply.Success = false
-	// if rf.currentTerm < args.Term {
-	// 	rf.currentTerm = args.Term
-	// }
+	if rf.currentTerm == args.Term {
+		rf.cancelElectionTimeout()
+	}
 
 	rf.mu.Unlock()
 }
@@ -538,6 +590,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		newLogEntry := LogEntry{command, rf.currentTerm}
 		rf.logs = append(rf.logs, newLogEntry)
 		rf.matchIndex[rf.me] = len(rf.logs)
+		rf.persist()
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
 				// Kick off the go routine for replicating the command
@@ -593,6 +646,7 @@ func (rf *Raft) initiateNewElection() {
 	rf.roleState = statusCandidate
 	rf.voteCnt = 1
 	rf.votedFor = rf.me
+	rf.persist()
 	// fmt.Print("Server ", strconv.Itoa(rf.me), " starts election with term ", strconv.Itoa(rf.currentTerm), ".\n")
 	// fmt.Print("Log length: ", strconv.Itoa(len(rf.logs)), " Last log term: ", strconv.Itoa(lastLogTerm), " \n")
 
@@ -611,11 +665,8 @@ func (rf *Raft) initiateNewElection() {
 //
 func (rf *Raft) electionTimeoutMonitor() {
 	// Periodically check per 5 msec
-	for {
+	for !rf.killed() {
 		time.Sleep(5 * time.Millisecond)
-		if rf.killed() {
-			break
-		}
 		rf.mu.Lock()
 		if rf.roleState == statusFollower {
 			timeNow := rf.getSysTime()
@@ -632,7 +683,7 @@ func (rf *Raft) electionTimeoutMonitor() {
 				// Win the election
 				rf.roleState = statusLeader
 				// Re-initialize next & match index
-				rf.cancelElectionTimeout()
+				// rf.cancelElectionTimeout()
 				rf.initNextMatchIndex()
 				// fmt.Print("Server ", strconv.Itoa(rf.me), " wins the election with term ", strconv.Itoa(rf.currentTerm), ".\n")
 			} else {
@@ -654,11 +705,8 @@ func (rf *Raft) electionTimeoutMonitor() {
 //
 func (rf *Raft) appendEntriesRoutine() {
 	// Periodically check per 5 msec
-	for {
+	for !rf.killed() {
 		time.Sleep(5 * time.Millisecond)
-		if rf.killed() {
-			break
-		}
 		rf.mu.Lock()
 		if rf.roleState == statusLeader {
 			// Check the time diff since last time sending out AppendEntries RPC
@@ -683,7 +731,7 @@ func (rf *Raft) applySingleLogEntry(commandIndex int) {
 	rf.cv.L.Lock()
 	commandToApply := ApplyMsg{true, rf.logs[commandIndex].Command, commandIndex + 1}
 	rf.applyCh <- commandToApply
-	// fmt.Print("Server ", strconv.Itoa(rf.me), " applies log ", strconv.Itoa(commandIndex), " \n")
+	// fmt.Print("Server ", strconv.Itoa(rf.me), " applies log ", strconv.Itoa(commandIndex), " with command ", rf.logs[commandIndex].Command, "\n")
 	rf.lastApplied += 1
 	rf.cv.Signal()
 	rf.cv.L.Unlock()
@@ -714,7 +762,10 @@ func (rf *Raft) applyLogEntriesRoutine() {
 			for rf.lastApplied < rf.commitIndex {
 				if lastSentOutIdx != rf.lastApplied {
 					lastSentOutIdx = rf.lastApplied
+					// fmt.Print("Server ", strconv.Itoa(rf.me), " applies log ", strconv.Itoa(lastSentOutIdx), " with command ", rf.logs[lastSentOutIdx].Command, "\n")
+					// fmt.Print("Server has ", strconv.Itoa(len(rf.logs)), " log entries\n")
 					go rf.applySingleLogEntry(rf.lastApplied)
+					// rf.lastApplied += 1
 				}
 				rf.cv.Wait()
 			}
@@ -746,7 +797,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.applyCh = applyCh
-	rf.transitToFollower(0, -1)
+	// DO NOT call rf.transitToFollower(0, -1) here since it will save persistant states
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.roleState = statusFollower
+	rf.voteCnt = 0
+	// Always need to cancel election timeout
+	rf.cancelElectionTimeout()
 	// Initialize next & match index
 	rf.initNextMatchIndex()
 	// Initialize commit info
