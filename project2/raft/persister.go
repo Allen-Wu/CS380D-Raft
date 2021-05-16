@@ -21,12 +21,6 @@ func MakePersister() *Persister {
 	return &Persister{}
 }
 
-func clone(orig []byte) []byte {
-	x := make([]byte, len(orig))
-	copy(x, orig)
-	return x
-}
-
 func (ps *Persister) Copy() *Persister {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -36,16 +30,16 @@ func (ps *Persister) Copy() *Persister {
 	return np
 }
 
-func (ps *Persister) SaveRaftState(state []byte) {
+func (ps *Persister) SaveRaftState(data []byte) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	ps.raftstate = clone(state)
+	ps.raftstate = data
 }
 
 func (ps *Persister) ReadRaftState() []byte {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	return clone(ps.raftstate)
+	return ps.raftstate
 }
 
 func (ps *Persister) RaftStateSize() int {
@@ -54,23 +48,14 @@ func (ps *Persister) RaftStateSize() int {
 	return len(ps.raftstate)
 }
 
-// Save both Raft state and K/V snapshot as a single atomic action,
-// to help avoid them getting out of sync.
-func (ps *Persister) SaveStateAndSnapshot(state []byte, snapshot []byte) {
+func (ps *Persister) SaveSnapshot(snapshot []byte) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	ps.raftstate = clone(state)
-	ps.snapshot = clone(snapshot)
+	ps.snapshot = snapshot
 }
 
 func (ps *Persister) ReadSnapshot() []byte {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	return clone(ps.snapshot)
-}
-
-func (ps *Persister) SnapshotSize() int {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	return len(ps.snapshot)
+	return ps.snapshot
 }
